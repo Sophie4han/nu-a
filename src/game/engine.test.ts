@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createInitialState } from "./initial-state";
-import { GameError, assignTask, startTask, submitForReview, requestRevision, approveReview, completeTask } from "./engine";
+import { GameError, assignTask, startTask, submitForReview, requestRevision, approveReview, completeTask, recordAIEvaluation } from "./engine";
 import type { GameErrorCode } from "./engine";
 import type { GameState } from "../types/game";
 
@@ -60,7 +60,7 @@ test("수정·재수행·재제출을 여러 번 반복하고 버전별 검수 �
     state = submitForReview(startTask(state, id), id, { ...sections, market: `수정 ${i}` });
     rejects(() => completeTask(state, id), "INVALID_REVIEW");
   }
-  state = completeTask(approveReview(state, id, { ...evaluation, evaluator: { kind: "ai", id: "future-adapter" }, scores: { evidence: 90 } }), id);
+  state = completeTask(approveReview(state, id, evaluation), id);
   assert.deepEqual(state.tasks[0].submissions.map(s => s.version), [1, 2, 3]);
   assert.deepEqual(state.tasks[0].reviews.map(r => r.decision), ["revision_requested", "revision_requested", "approved"]);
 });
@@ -145,11 +145,13 @@ test("AI 평가의 서술·점수가 수정 요청부터 완료까지 회사 재
     evaluator: { kind: "ai" as const, id: "test-ai" },
     scores: { cash: 0, cumulativeRevenue: 100_000_000, cumulativeExpenses: 50_000_000 },
   };
-  const revision = requestRevision(original, id, aiEvaluation);
+  const evaluated = recordAIEvaluation(original, id, 1, aiEvaluation);
+  const revision = requestRevision(evaluated, id, evaluation);
   const resubmitted = submitForReview(startTask(revision, id), id, sections);
-  const approved = approveReview(resubmitted, id, aiEvaluation);
+  const reevaluated = recordAIEvaluation(resubmitted, id, 2, aiEvaluation);
+  const approved = approveReview(reevaluated, id, evaluation);
   const completed = completeTask(approved, id);
-  for (const state of [original, revision, resubmitted, approved, completed]) {
+  for (const state of [original, evaluated, revision, resubmitted, reevaluated, approved, completed]) {
     assert.deepEqual(state.company, company);
   }
 });
@@ -160,4 +162,74 @@ test("모든 업무 처리 함수가 존재하지 않는 업무 ID를 차단", (
   rejects(() => requestRevision(reviewing(), "missing", evaluation), "NOT_FOUND");
   rejects(() => approveReview(reviewing(), "missing", evaluation), "NOT_FOUND");
   rejects(() => completeTask(approveReview(reviewing(), id, evaluation), "missing"), "NOT_FOUND");
+});
+
+const aiEvaluation = {
+  feedback: "근거가 충분합니다. 품질이 우수합니다.",
+  evaluator: { kind: "ai" as const, id: "test-ai" },
+  scores: { quality: 100 },
+};
+
+test("긍정적 AI 평가는 상태·직원을 변경하지 않으며 플레이어 승인 후에만 완료", () => {
+  const original = reviewing();
+  freeze(original);
+  const input = structuredClone(aiEvaluation);
+  const state = recordAIEvaluation(original, id, 1, input);
+  input.scores.quality = 0;
+  input.evaluator.id = "changed";
+  assert.equal(original.tasks[0].reviews.length, 0);
+  assert.equal(state.tasks[0].status, "review");
+  assert.deepEqual(state.employees, original.employees);
+  assert.equal(state.tasks[0].reviews[0].decision, "evaluated");
+  assert.equal(state.tasks[0].reviews[0].submissionVersion, 1);
+  assert.equal(state.tasks[0].reviews[0].scores?.quality, 100);
+  assert.equal(state.tasks[0].reviews[0].evaluator.id, "test-ai");
+  rejects(() => completeTask(state, id), "INVALID_REVIEW");
+  const approved = approveReview(state, id, evaluation);
+  assert.deepEqual(approved.tasks[0].reviews.map(r => [r.decision, r.submissionVersion]), [["evaluated", 1], ["approved", 1]]);
+  assert.equal(completeTask(approved, id).tasks[0].status, "completed");
+});
+
+test("AI의 승인·수정 요청은 타입과 런타임에서 모두 차단", () => {
+  // @ts-expect-error AI is not a player decision input.
+  rejects(() => approveReview(reviewing(), id, aiEvaluation), "INVALID_REVIEW");
+  // @ts-expect-error AI cannot request revisions on behalf of the player.
+  rejects(() => requestRevision(reviewing(), id, aiEvaluation), "INVALID_REVIEW");
+  const legacy = reviewing();
+  const oldAIApproval = { ...aiEvaluation, decision: "approved", submissionVersion: 1, day: 1 };
+  const restored = { ...legacy, tasks: [{ ...legacy.tasks[0], reviews: [oldAIApproval] }] } as unknown as GameState;
+  rejects(() => completeTask(restored, id), "INVALID_REVIEW");
+});
+
+test("AI 평가 후 수정·재제출 시 버전 보존 및 지연된 이전 버전 평가 차단", () => {
+  const assessed = recordAIEvaluation(reviewing(), id, 1, aiEvaluation);
+  const revision = requestRevision(assessed, id, evaluation);
+  const resubmitted = submitForReview(startTask(revision, id), id, sections);
+  assert.deepEqual(resubmitted.tasks[0].reviews.map(r => r.decision), ["evaluated", "revision_requested"]);
+  rejects(() => recordAIEvaluation(resubmitted, id, 1, aiEvaluation), "INVALID_REVIEW");
+  const assessedAgain = recordAIEvaluation(resubmitted, id, 2, aiEvaluation);
+  rejects(() => completeTask(assessedAgain, id), "INVALID_REVIEW");
+  assert.equal(completeTask(approveReview(assessedAgain, id, evaluation), id).tasks[0].status, "completed");
+});
+
+test("복원된 이전 버전의 플레이어 승인으로 최신 제출물을 완료할 수 없음", () => {
+  const oldApproval = approveReview(reviewing(), id, evaluation).tasks[0].reviews[0];
+  const resubmitted = submitForReview(startTask(requestRevision(reviewing(), id, evaluation), id), id, sections);
+  const restored = { ...resubmitted, tasks: [{ ...resubmitted.tasks[0], reviews: [oldApproval] }] };
+  rejects(() => completeTask(restored, id), "INVALID_REVIEW");
+  assert.equal(completeTask(approveReview(restored, id, evaluation), id).tasks[0].status, "completed");
+});
+
+test("AI 평가 입력·상태 검증 및 수동 검수 유지", () => {
+  rejects(() => recordAIEvaluation(reviewing(), "missing", 1, aiEvaluation), "NOT_FOUND");
+  rejects(() => recordAIEvaluation(progressing(), id, 1, aiEvaluation), "INVALID_TRANSITION");
+  rejects(() => recordAIEvaluation(reviewing(), id, 2, aiEvaluation), "INVALID_REVIEW");
+  rejects(() => recordAIEvaluation(reviewing(), id, 1, { ...aiEvaluation, feedback: " " }), "INVALID_REVIEW");
+  rejects(() => recordAIEvaluation(reviewing(), id, 1, { ...aiEvaluation, scores: { quality: Infinity } }), "INVALID_REVIEW");
+  // @ts-expect-error Player input is not an AI evaluation.
+  rejects(() => recordAIEvaluation(reviewing(), id, 1, evaluation), "INVALID_REVIEW");
+  const approved = approveReview(reviewing(), id, evaluation);
+  assert.equal(approved.tasks[0].reviews.some(r => r.decision === "evaluated"), false);
+  rejects(() => recordAIEvaluation(approved, id, 1, aiEvaluation), "INVALID_REVIEW");
+  assert.equal(completeTask(approved, id).tasks[0].status, "completed");
 });

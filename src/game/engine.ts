@@ -1,4 +1,4 @@
-import type { Employee, Evaluation, GameState, Review, Task, TaskStatus } from "../types/game";
+import type { AIEvaluation, Employee, Evaluation, GameState, PlayerEvaluation, Review, Task, TaskStatus } from "../types/game";
 
 export type GameErrorCode = "NOT_FOUND" | "INVALID_TRANSITION" | "EMPLOYEE_BUSY" | "ROLE_MISMATCH" | "INVALID_SUBMISSION" | "INVALID_REVIEW" | "INCONSISTENT_STATE";
 export class GameError extends Error {
@@ -55,24 +55,39 @@ export function submitForReview(state: GameState, taskId: string, sections: Read
   requireCondition(task.requirements.every(r => Object.hasOwn(sections, r.id) && typeof sections[r.id] === "string" && sections[r.id].trim().length > 0), "INVALID_SUBMISSION", "필수 결과물을 모두 작성해야 합니다.");
   return replace(state, { ...task, status: "review", submissions: [...task.submissions, { version: task.submissions.length + 1, day: state.company.day, sections: { ...sections } }] });
 }
-function review(state: GameState, taskId: string, evaluation: Evaluation, decision: Review["decision"]): GameState {
+function validateEvaluation(evaluation: Evaluation): void {
+  requireCondition(evaluation.feedback.trim() && evaluation.evaluator.id.trim() && Object.values(evaluation.scores ?? {}).every(Number.isFinite), "INVALID_REVIEW", "검수 정보가 올바르지 않습니다.");
+}
+
+export function recordAIEvaluation(state: GameState, taskId: string, submissionVersion: number, evaluation: AIEvaluation): GameState {
   const task = getTask(state, taskId, ["review"]);
+  requireCondition(evaluation.evaluator.kind === "ai", "INVALID_REVIEW", "AI 평가만 기록할 수 있습니다.");
+  requireCondition(task.submissions.at(-1)?.version === submissionVersion, "INVALID_REVIEW", "현재 제출 버전과 AI 평가 버전이 일치하지 않습니다.");
+  requireCondition(!task.reviews.some(r => r.submissionVersion === submissionVersion && r.decision !== "evaluated"), "INVALID_REVIEW", "이미 최종 검수된 제출물입니다.");
+  validateEvaluation(evaluation);
+  const result: Review = { ...structuredClone(evaluation), decision: "evaluated", submissionVersion, day: state.company.day };
+  return replace(state, { ...task, reviews: [...task.reviews, result] });
+}
+
+function review(state: GameState, taskId: string, evaluation: PlayerEvaluation, decision: "approved" | "revision_requested"): GameState {
+  const task = getTask(state, taskId, ["review"]);
+  requireCondition(evaluation.evaluator.kind === "player", "INVALID_REVIEW", "최종 승인과 수정 요청은 플레이어만 할 수 있습니다.");
   const submission = task.submissions.at(-1);
-  requireCondition(submission && !task.reviews.some(r => r.submissionVersion === submission.version), "INVALID_REVIEW", "검수할 미평가 제출물이 없습니다.");
-  requireCondition(evaluation.feedback.trim() && evaluation.evaluator.id.trim() && ["player", "ai"].includes(evaluation.evaluator.kind) && Object.values(evaluation.scores ?? {}).every(Number.isFinite), "INVALID_REVIEW", "검수 정보가 올바르지 않습니다.");
+  requireCondition(submission && !task.reviews.some(r => r.submissionVersion === submission.version && r.decision !== "evaluated"), "INVALID_REVIEW", "검수할 미평가 제출물이 없습니다.");
+  validateEvaluation(evaluation);
   const result: Review = { ...structuredClone(evaluation), decision, submissionVersion: submission.version, day: state.company.day };
   return replace(state, { ...task, status: decision === "approved" ? "review" : "revision", reviews: [...task.reviews, result] });
 }
-export function requestRevision(state: GameState, taskId: string, evaluation: Evaluation): GameState {
+export function requestRevision(state: GameState, taskId: string, evaluation: PlayerEvaluation): GameState {
   return review(state, taskId, evaluation, "revision_requested");
 }
-export function approveReview(state: GameState, taskId: string, evaluation: Evaluation): GameState {
+export function approveReview(state: GameState, taskId: string, evaluation: PlayerEvaluation): GameState {
   return review(state, taskId, evaluation, "approved");
 }
 export function completeTask(state: GameState, taskId: string): GameState {
   const task = getTask(state, taskId, ["review"]);
   const latest = task.submissions.at(-1);
-  requireCondition(latest && task.reviews.some(r => r.submissionVersion === latest.version && r.decision === "approved"), "INVALID_REVIEW", "최신 결과물의 검수 승인이 필요합니다.");
+  requireCondition(latest && task.reviews.some(r => r.submissionVersion === latest.version && r.decision === "approved" && r.evaluator.kind === "player"), "INVALID_REVIEW", "최신 결과물의 검수 승인이 필요합니다.");
   const employee = state.employees.find(e => e.id === task.assigneeId);
   requireCondition(employee, "INCONSISTENT_STATE", "담당 직원이 없습니다.");
   return replace(state, { ...task, status: "completed" }, { ...employee, status: "idle", currentTaskId: null });

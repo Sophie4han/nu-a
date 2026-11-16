@@ -21,15 +21,22 @@ export interface Submission {
   readonly sections: Readonly<Record<string, string>>;
 }
 // Evaluation text is informational: it never changes financial metrics.
-export interface Review {
-  readonly submissionVersion: number;
-  readonly day: number;
-  readonly decision: "approved" | "revision_requested";
+export interface Evaluation {
   readonly feedback: string;
   readonly evaluator: { readonly kind: "player" | "ai"; readonly id: string };
   readonly scores?: Readonly<Record<string, number>>;
 }
-export type Evaluation = Omit<Review, "submissionVersion" | "day" | "decision">;
+export type PlayerEvaluation = Evaluation & {
+  readonly evaluator: { readonly kind: "player"; readonly id: string };
+};
+export type AIEvaluation = Evaluation & {
+  readonly evaluator: { readonly kind: "ai"; readonly id: string };
+};
+// Keep one versioned history, with advisory AI entries distinct from player decisions.
+export type Review = { readonly submissionVersion: number; readonly day: number } & (
+  | (PlayerEvaluation & { readonly decision: "approved" | "revision_requested" })
+  | (AIEvaluation & { readonly decision: "evaluated" })
+);
 export interface Task {
   readonly id: string;
   readonly title: string;
